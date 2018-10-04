@@ -58,6 +58,9 @@ static const char FOPEN_FLAGS[] = "at";
 /* size of output buffer (arbitrary) */
 #define DBG_BUFFER_SIZE 20000
 
+/* maximum attempts when writing to output file */
+#define MAX_FPUT_OUTPUT_FILE_RETRY 10
+
 /* global and static variables */
 
 LPCWSTR W16_NULLSTRING = (LPCWSTR) "N\0U\0L\0L\0\0";
@@ -130,7 +133,8 @@ static const char INDENT_CHAR = '.';
 static BOOL DBG_get_indent(DBG_LEVEL_ID level, const char *format, 
                            char *indent_string);
 
-static CRITICAL_SECTION fprintf_crit_section;
+/* used to synchronize writing to output_file */
+static CRITICAL_SECTION output_file_crit_section;
 
 /* Function definitions */
 
@@ -155,7 +159,7 @@ BOOL DBG_init_channels(void)
     DWORD flag_mask = 0;
     int ret;
 
-    InternalInitializeCriticalSection(&fprintf_crit_section);
+    InternalInitializeCriticalSection(&output_file_crit_section);
 
     /* output only asserts by default [only affects no-vararg-support case; if 
        we have varargs, these flags aren't even checked for ASSERTs] */
@@ -370,7 +374,7 @@ BOOL DBG_init_channels(void)
         {
             fprintf(stderr, "ERROR : pthread_key_create() failed error:%d (%s)\n", 
                    ret, strerror(ret));
-            DeleteCriticalSection(&fprintf_crit_section);;
+            DeleteCriticalSection(&output_file_crit_section);;
             return FALSE;
         }
     }
@@ -399,7 +403,7 @@ void DBG_close_channels()
 
     output_file = NULL;
 
-    DeleteCriticalSection(&fprintf_crit_section);
+    DeleteCriticalSection(&output_file_crit_section);
 
     /* if necessary, release TLS key for entry nesting level */
     if(0 != max_entry_level)
@@ -442,6 +446,33 @@ static const void *DBG_get_module_id()
 #define MODULE_FORMAT
 #endif // FEATURE_PAL_SXS
 
+
+/*++
+Function :
+    fput_with_retries
+
+    Writes the C string pointed to by str to the stream.  Will make multiple
+    attempts if not all the data is written.
+
+Parameters :
+    LPSTR str : the string to print
+
+Return value :
+    TRUE on success, FALSE on failure
+--*/
+static BOOL fput_with_retries(LPSTR str, FILE *stream)
+{
+    int fail_count = 0;
+    for (;;)
+    {
+        int result = fputs(str, stream);
+        if (result >= 0)
+            return TRUE; // success
+        fail_count++;
+        if (fail_count == MAX_FPUT_OUTPUT_FILE_RETRY)
+            return FALSE; // fail
+    }
+}
 
 /*++
 Function :
@@ -533,13 +564,22 @@ int DBG_printf_gcc(DBG_CHANNEL_ID channel, DBG_LEVEL_ID level, BOOL bHeader,
         fprintf(stderr, "ERROR : buffer overflow in DBG_printf_gcc");
     }
 
-    /* Use a Critical section before calling printf code to
+    /* Use a Critical section before calling fput to
        avoid holding a libc lock while another thread is calling
        SuspendThread on this one. */
+    BOOL fput_failed = FALSE;
+    InternalEnterCriticalSection(pthrCurrent, &output_file_crit_section);
+    if (!fput_with_retries(indent, output_file))
+        fput_failed = TRUE;
+    if (!fput_with_retries(buffer, output_file))
+        fput_failed = TRUE;
+    InternalLeaveCriticalSection(pthrCurrent, &output_file_crit_section);
 
-    InternalEnterCriticalSection(pthrCurrent, &fprintf_crit_section);
-    fprintf( output_file, "%s%s", indent, buffer );
-    InternalLeaveCriticalSection(pthrCurrent, &fprintf_crit_section);
+    if (fput_failed)
+    {
+        fprintf(stderr, "ERROR : fput to debug output file failed errno:%d (%s)\n",
+                errno, strerror(errno));
+    }
 
     /* flush the output to file */
     if ( fflush(output_file) != 0 )
@@ -636,13 +676,21 @@ int DBG_printf_c99(DBG_CHANNEL_ID channel, DBG_LEVEL_ID level, BOOL bHeader,
     if(output_size>DBG_BUFFER_SIZE)
         fprintf(stderr, "ERROR : buffer overflow in DBG_printf_c99");
 
-    /* Use a Critical section before calling printf code to
+    /* Use a Critical section before calling fput code to
        avoid holding a libc lock while another thread is calling
        SuspendThread on this one. */
 
-    InternalEnterCriticalSection(pthrCurrent, &fprintf_crit_section);
-    fprintf( output_file, "%s", buffer );
-    InternalLeaveCriticalSection(pthrCurrent, &fprintf_crit_section);
+    BOOL fput_failed = FALSE;
+    InternalEnterCriticalSection(pthrCurrent, &output_file_crit_section);
+    if (!fput_with_retries(buffer, output_file))
+        fput_failed = TRUE;
+    InternalLeaveCriticalSection(pthrCurrent, &output_file_crit_section);
+
+    if (fput_failed)
+    {
+        fprintf(stderr, "ERROR : fput to debug output file failed errno:%d (%s)\n",
+                errno, strerror(errno));
+    }
 
     /* flush the output to file every once in a while */
     call_count++;
