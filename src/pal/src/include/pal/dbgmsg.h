@@ -322,24 +322,16 @@ bool DBG_ShouldCheckStackAlignment();
         BOOL __bHeader = bHeader;\
         DBG_PRINTF2
 
-#ifdef __GNUC__
 #define DBG_PRINTF2(args...)\
         DBG_printf_gcc(__chanid,__levid,__bHeader,__FUNCTION__,__FILE__,\
                        __LINE__,args);\
     }\
 }
-#else /* __GNUC__ */
-#define DBG_PRINTF2(...)\
-      DBG_printf_c99(__chanid,__levid,__bHeader,__FILE__,__LINE__,__VA_ARGS__);\
-    }\
-}
-#endif /* __GNUC__ */
 
 #endif /* _ENABLE_DEBUG_MESSAGES_ */
 
 /* Use GNU C-specific features if available : __FUNCTION__ pseudo-macro,
    variable-argument macros */
-#ifdef __GNUC__
 
 /* define NOTRACE as nothing; this will absorb the variable-argument list used
    in tracing macros */
@@ -389,59 +381,8 @@ bool DBG_ShouldCheckStackAlignment();
 
 #endif /* defined(_DEBUG) */
 
-#else /* __GNUC__ */
-/* Not GNU C : C99 [the latest version of the ISO C Standard] specifies
-   a different syntax for variable-argument macros, so try using that*/
-#if defined __STDC_VERSION__ && __STDC_VERSION__ >=199901L
-
-/* define NOTRACE as nothing; this will absorb the variable-argument list used
-   in tracing macros */
-#define NOTRACE(...)
-
-#if !defined(_DEBUG)
-
-#define ASSERT(...)
-#define _ASSERT(expr) 
-#define _ASSERTE(expr) 
-#define _ASSERT_MSG(...) 
-
-#else /* defined(_DEBUG) */
-
-#define ASSERT(...)                                                     \
-{                                                                       \
-    __ASSERT_ENTER();                                                   \
-    if (output_file && dbg_master_switch)                               \
-    {                                                                   \
-        DBG_printf_c99(defdbgchan,DLI_ASSERT,TRUE,__FILE__,__LINE__,__VA_ARGS__); \
-    }                                                                   \
-    if(g_Dbg_asserts_enabled)                                           \
-    {                                                                   \
-        PAL_Leave();                                                    \
-        DebugBreak();                                                   \
-    }                                                                   \
-}
-    
-#define _ASSERT(expr) do { if (!(expr)) { ASSERT(""); } } while(0)
-#define _ASSERTE(expr) do { if (!(expr)) { ASSERT("Expression: " #expr "\n"); } } while(0)
-#define _ASSERT_MSG(expr, ...) \
-    do { \
-        if (!(expr)) \
-        { \
-            ASSERT("Expression: " #expr ", Description: " __VA_ARGS__); \
-        } \
-    } while(0)
-
-#endif /* !_DEBUG */
-
-#else /* __STDC_VERSION__ */
-/* Not GNU C, not C99 :  
-   possible work around for the lack of variable-argument macros: 
-   by using 2 function calls; must wrap the whole thing in a critical 
-   section to avoid interleaved output from multiple threads */
-
-#error The compiler is missing support for variable-argument macros.
-
-#endif /* __STDC_VERSION__*/
+#ifndef __GNUC__
+#error The compiler is missing support for variable-argument macros and the __FUNCTION__ macro.
 #endif /* __GNUC__ */
 
 /* Function declarations */
