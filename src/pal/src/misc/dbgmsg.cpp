@@ -442,6 +442,34 @@ static const void *DBG_get_module_id()
 #define MODULE_FORMAT
 #endif // FEATURE_PAL_SXS
 
+struct ScopedBuffer
+{
+    CHAR *ptr;
+    BOOL on_heap;
+    ScopedBuffer(CHAR *alloca_value, size_t size)
+    {
+        if (alloca_value)
+        {
+            ptr = alloca_value;
+            on_heap = FALSE;
+        }
+        else
+        {
+            ptr = (CHAR*)malloc(size);
+            on_heap = TRUE;
+        }
+    }
+    ~ScopedBuffer()
+    {
+        if (on_heap && ptr)
+        {
+            free(ptr);
+            ptr = NULL;
+        }
+    }
+};
+#define ALLOC_SCOPED_BUFFER(name, size) ScopedBuffer name((CHAR*)alloca(size), size)
+
 /*++
 Function :
     DBG_printf
@@ -470,66 +498,86 @@ Notes :
 int DBG_printf(DBG_CHANNEL_ID channel, DBG_LEVEL_ID level, BOOL bHeader,
                LPCSTR function, LPCSTR file, INT line, LPCSTR format, ...)
 {
-    CHAR *buffer = (CHAR*)alloca(DBG_BUFFER_SIZE);
+    struct SavedErrno
+    {
+        int saved;
+        SavedErrno() : saved(errno) { }
+        ~SavedErrno()
+        {
+            if ( saved != errno )
+            {
+                fprintf( stderr,"ERROR : errno changed from %d to %d inside DBG_printf\n", errno, saved );
+                errno = saved;
+            }
+        }
+    } saved_errno;
+
     CHAR indent[MAX_NESTING+1];
-    LPSTR buffer_ptr;
-    INT output_size;
-    va_list args;
-    void *thread_id;
-    int old_errno = 0;
-
-    old_errno = errno;
-
     if(!DBG_get_indent(level, format, indent))
     {
+        // Note: we will drop log messages here if the indent gets too high, and we won't print
+        //       an error when this occurs.
         return 1;
     }
 
-    thread_id = (void *)THREADSilentGetCurrentThreadId();
+    void *thread_id = (void *)THREADSilentGetCurrentThreadId();
 
+    ALLOC_SCOPED_BUFFER(buffer, DBG_BUFFER_SIZE);
+    if( buffer.ptr == NULL )
+    {
+        fprintf(stderr, "ERROR : DBG_printf: out of memory\n");
+        return 1;
+    }
+
+    INT output_size;
     if(bHeader)
     {
         /* Print file instead of function name for ENTRY messages, because those
            already include the function name */
         /* also print file name for ASSERTs, to match Win32 behavior */
+        LPCSTR location;
         if( DLI_ENTRY == level || DLI_ASSERT == level || DLI_EXIT == level)
-        {
-            output_size=snprintf(buffer, DBG_BUFFER_SIZE,
-                                 "{%p" MODULE_FORMAT "} %-5s [%-7s] at %s.%d: ",
-                                 thread_id, MODULE_ID
-                                 dbg_level_names[level], dbg_channel_names[channel], file, line);
-        }
+            location = file;
         else
+            location = function;
+        output_size=snprintf(buffer.ptr, DBG_BUFFER_SIZE,
+                             "{%p" MODULE_FORMAT "} %-5s [%-7s] at %s.%d: ",
+                             thread_id, MODULE_ID
+                             dbg_level_names[level], dbg_channel_names[channel], location, line);
+        if( output_size < 0)
         {
-            output_size=snprintf(buffer, DBG_BUFFER_SIZE,
-                                 "{%p" MODULE_FORMAT "} %-5s [%-7s] at %s.%d: ",
-                                 thread_id, MODULE_ID
-                                 dbg_level_names[level], dbg_channel_names[channel], function, line);
+            fprintf(stderr, "ERROR : DBG_printf: snprintf header failed errno:%d (%s)\n", errno, strerror(errno));
+            output_size = 0; // don't return, just drop the header from the log message
         }
-
-        if(output_size + 1 > DBG_BUFFER_SIZE)
+        else if (output_size > DBG_BUFFER_SIZE)
         {
-            fprintf(stderr, "ERROR : buffer overflow in DBG_printf");
-            return 1;
+            // output size cannot be larger than DBG_BUFFER_SIZE because the expression
+            // DBG_BUFFER_SIZE-output_size is used below.
+            output_size = DBG_BUFFER_SIZE;
         }
-        
-        buffer_ptr=buffer+output_size;
     }
     else
     {
-        buffer_ptr = buffer;
         output_size = 0;
     }
 
-    va_start(args, format);
-
-    output_size+=_vsnprintf_s(buffer_ptr, DBG_BUFFER_SIZE-output_size, _TRUNCATE,
-                              format, args);
-    va_end(args);
-
-    if( output_size > DBG_BUFFER_SIZE )
     {
-        fprintf(stderr, "ERROR : buffer overflow in DBG_printf");
+        va_list args;
+        va_start(args, format);
+        INT result = _vsnprintf_s(buffer.ptr+output_size, DBG_BUFFER_SIZE-output_size, _TRUNCATE,
+                                  format, args);
+        va_end(args);
+        if( result < 0 )
+        {
+            fprintf(stderr, "ERROR : DBG_printf: vsnprintf_s failed errno:%d (%s)\n", errno, strerror(errno));
+            return 1;
+        }
+        output_size += result;
+    }
+
+    if( output_size >= DBG_BUFFER_SIZE )
+    {
+        fprintf(stderr, "ERROR : DBG_printf: message truncated, size=%d, max=%d", output_size, DBG_BUFFER_SIZE);
     }
 
     /* Use a Critical section before calling printf code to
@@ -537,7 +585,7 @@ int DBG_printf(DBG_CHANNEL_ID channel, DBG_LEVEL_ID level, BOOL bHeader,
        SuspendThread on this one. */
 
     InternalEnterCriticalSection(NULL, &fprintf_crit_section);
-    fprintf( output_file, "%s%s", indent, buffer );
+    fprintf( output_file, "%s%s", indent, buffer.ptr );
     InternalLeaveCriticalSection(NULL, &fprintf_crit_section);
 
     /* flush the output to file */
@@ -549,13 +597,7 @@ int DBG_printf(DBG_CHANNEL_ID channel, DBG_LEVEL_ID level, BOOL bHeader,
 
     // Some systems support displaying a GUI dialog. We attempt this only for asserts.
     if ( level == DLI_ASSERT )
-        PAL_DisplayDialog("PAL ASSERT", buffer);
-
-    if ( old_errno != errno )
-    {
-        fprintf( stderr,"ERROR: errno changed by DBG_printf\n" );
-        errno = old_errno;
-    }
+        PAL_DisplayDialog("PAL ASSERT", buffer.ptr);
 
     return 1;
 }
